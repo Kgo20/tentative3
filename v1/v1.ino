@@ -43,15 +43,9 @@ volatile bool g_localGapDetected = false;
 volatile uint8_t g_localGapTargetSeq = 0;
 volatile bool g_remoteNackReceived = false;
 volatile uint8_t g_remoteNackTargetSeq = 0;
-
-// Prefixes de log dépendant de l'ESP_ID
-#if ESP_ID == 1
-const char TX_PREFIX[] = "TX1";
-const char RX_PREFIX[] = "RX1";
-#else
-const char TX_PREFIX[] = "TX2";
-const char RX_PREFIX[] = "RX2";
-#endif
+// Empeche de renvoyer un NACK a chaque nouvelle trame hors-sequence tant que
+// l'episode d'erreur en cours (meme trame attendue) n'est pas resolu.
+bool g_nackAlreadySentForEpisode = false;
 
 // ============================================================================
 // LOGS DIFFÉRÉS
@@ -87,6 +81,8 @@ void logFlush(char *buf, size_t *len)
   if (*len > 0)
   {
     Serial.print(buf);
+    Serial.println();
+    Serial.println();
   }
   buf[0] = '\0';
   *len = 0;
@@ -465,8 +461,10 @@ void sendAcquisitionMessage()
   if (totalPackets == 0)
     return;
 
-  logAppend(g_txLogBuf, &g_txLogLen, "[%s] J'envoie %d paquets de donnees\n", TX_PREFIX, totalPackets);
+  logAppend(g_txLogBuf, &g_txLogLen, "[TX] J'envoie %d paquets de donnees\n", totalPackets);
   g_errorAlreadyInjected = false;
+  g_remoteNackReceived = false; // reset: ignorer tout residu d'une session precedente
+  g_localGapDetected = false;
 
   Frame fBegin;
   buildFrame(&fBegin, FRAME_TYPE_DEBUT, 0, totalPackets, 0, 0);
@@ -480,13 +478,14 @@ void sendAcquisitionMessage()
       uint8_t target = g_remoteNackTargetSeq;
       g_remoteNackReceived = false;
       logAppend(g_txLogBuf, &g_txLogLen,
-                "[TX] >>> NACK recu du recepteur: retransmission a partir du paquet seq=%d <<<\n", target);
+                "[TX] NACK recu -> retransmission a partir de la trame %d\n", target);
       i = target - 1;
       continue;
     }
 
     Frame fData;
     buildFrame(&fData, FRAME_TYPE_DATA, i + 1, 0, packets[i], packetLens[i]);
+    logAppend(g_txLogBuf, &g_txLogLen, "[TX] Envoi trame %d: %s\n", i + 1, acquireDonnees(i));
     maybeInjectBitError(&fData);
     sendFrame(&fData);
 
@@ -498,7 +497,7 @@ void sendAcquisitionMessage()
       buildFrame(&fNack, FRAME_TYPE_NACK, 0, target, 0, 0);
       sendFrame(&fNack);
       logAppend(g_txLogBuf, &g_txLogLen,
-                "[TX] >>> Erreur detectee cote reception: demande de renvoi du paquet seq=%d <<<\n", target);
+                "[TX] Erreur detectee sur la reception locale -> envoi d'un NACK pour la trame %d\n", target);
     }
 
     i++;
@@ -507,6 +506,7 @@ void sendAcquisitionMessage()
   Frame fEnd;
   buildFrame(&fEnd, FRAME_TYPE_FIN, totalPackets, 0, 0, 0);
   sendFrame(&fEnd);
+  logAppend(g_txLogBuf, &g_txLogLen, "[TX] Session terminee (FIN envoye)\n");
 }
 
 // ============================================================================
@@ -535,6 +535,8 @@ void taskRX(void *pvParameters)
     {
       assembledLen = 0;
       g_rxExpectedSeq = 1;
+      g_localGapDetected = false;
+      g_nackAlreadySentForEpisode = false;
       logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] Debut: %d paquets attendus\n", rxFrame.param);
     }
     else if (rxFrame.type == FRAME_TYPE_DATA)
@@ -542,20 +544,30 @@ void taskRX(void *pvParameters)
       if (!rxFrame.crcValid)
       {
         logAppend(g_rxLogBuf, &g_rxLogLen,
-                  "[RX] !!! ERREUR DETECTEE sur trame seq=%d (CRC invalide) -> demande de renvoi du paquet %d !!!\n",
-                  rxFrame.seqNum, g_rxExpectedSeq);
-        g_localGapTargetSeq = g_rxExpectedSeq;
-        g_localGapDetected = true;
+                  "[RX] J'ai recu trame %d: refusee, erreur CRC detectee\n", rxFrame.seqNum);
+        if (!g_nackAlreadySentForEpisode)
+        {
+          g_localGapTargetSeq = g_rxExpectedSeq;
+          g_localGapDetected = true;
+          g_nackAlreadySentForEpisode = true;
+        }
       }
       else if (rxFrame.seqNum != g_rxExpectedSeq)
       {
-        logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] Desynchronisation: attendu %d, recu %d -> NACK(%d)\n",
-                  g_rxExpectedSeq, rxFrame.seqNum, g_rxExpectedSeq);
-        g_localGapTargetSeq = g_rxExpectedSeq;
-        g_localGapDetected = true;
+        logAppend(g_rxLogBuf, &g_rxLogLen,
+                  "[RX] J'ai recu trame %d: refusee, en attente de la trame %d\n",
+                  rxFrame.seqNum, g_rxExpectedSeq);
+        if (!g_nackAlreadySentForEpisode)
+        {
+          g_localGapTargetSeq = g_rxExpectedSeq;
+          g_localGapDetected = true;
+          g_nackAlreadySentForEpisode = true;
+        }
       }
       else if (assembledLen + rxFrame.payloadLen + 1 <= (int)sizeof(assembledMsg) - 1)
       {
+        logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] J'ai recu trame %d: %.*s\n",
+                  rxFrame.seqNum, rxFrame.payloadLen, rxFrame.payload);
         if (assembledLen > 0)
         {
           assembledMsg[assembledLen] = '\n';
@@ -564,28 +576,32 @@ void taskRX(void *pvParameters)
         memcpy(&assembledMsg[assembledLen], rxFrame.payload, rxFrame.payloadLen);
         assembledLen += rxFrame.payloadLen;
         g_rxExpectedSeq++;
+        g_nackAlreadySentForEpisode = false; // trame attendue recue: episode resolu
       }
     }
     else if (rxFrame.type == FRAME_TYPE_FIN)
     {
       assembledMsg[assembledLen] = '\0';
-      logAppend(g_rxLogBuf, &g_rxLogLen, "[%s] Je reçois: \"%s\"\n", RX_PREFIX, assembledMsg);
+      logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] Session terminee, message complet recu:\n%s\n", assembledMsg);
       memset(assembledMsg, 0, sizeof(assembledMsg));
+      logFlush(g_rxLogBuf, &g_rxLogLen); // fin de session: on affiche le resume complet
     }
     else if (rxFrame.type == FRAME_TYPE_NACK)
     {
-      logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] NACK recu pour paquet %d\n", rxFrame.param);
-      g_remoteNackTargetSeq = rxFrame.param;
-      g_remoteNackReceived = true;
+      if (!g_remoteNackReceived)
+      {
+        logAppend(g_rxLogBuf, &g_rxLogLen, "[RX] NACK recu pour paquet %d\n", rxFrame.param);
+        g_remoteNackTargetSeq = rxFrame.param;
+        g_remoteNackReceived = true;
+      }
     }
     else
     {
       logAppend(g_rxLogBuf, &g_rxLogLen,
                 "[RX] ERREUR: type de trame inconnu 0x%02X seq=%d len=%d param=%d\n",
                 rxFrame.type, rxFrame.seqNum, rxFrame.payloadLen, rxFrame.param);
+      logFlush(g_rxLogBuf, &g_rxLogLen);
     }
-
-    logFlush(g_rxLogBuf, &g_rxLogLen);
   }
 }
 
