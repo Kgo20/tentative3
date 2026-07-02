@@ -58,7 +58,7 @@ bool g_nackAlreadySentForEpisode = false;
 // dans un buffer global et on l'affiche seulement une fois la trame terminée,
 // juste avant l'attente entre deux envois/réceptions.
 
-#define LOG_BUF_SIZE 1024
+#define LOG_BUF_SIZE 3072
 char g_txLogBuf[LOG_BUF_SIZE];
 size_t g_txLogLen = 0;
 char g_rxLogBuf[LOG_BUF_SIZE];
