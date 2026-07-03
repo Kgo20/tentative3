@@ -23,7 +23,7 @@
 #define FRAME_TYPE_FIN 0x03
 #define FRAME_TYPE_NACK 0x04
 
-#define BIT_ERROR_PROBABILITY_PCT 1 // 0 = jamais, 1 = force un flip sur le paquet seq=2 (test deterministe)
+#define ENABLE_ERROR_INJECTION 1
 
 // Structure de trame
 typedef struct
@@ -427,25 +427,35 @@ int loadDonneesIntoPackets(uint8_t packets[][MAX_PAYLOAD], uint8_t *packetLens, 
   return count;
 }
 
-// Injection d'erreur deterministe pour test: BIT_ERROR_PROBABILITY_PCT=0 -> jamais,
-// =1 -> flip force sur le paquet seq=2 uniquement (reproductible pour debug/demo).
 bool g_errorAlreadyInjected = false; // n'injecter qu'une seule fois par session (pas a chaque retransmission)
+uint8_t g_errorFrameSeq = 0;   // numéro de trame (1..5) qui sera corrompue
 
 void maybeInjectBitError(Frame *f)
 {
-  if (!f || f->payloadLen == 0)
-    return;
+    if (!f || f->payloadLen == 0)
+        return;
 
-  if (BIT_ERROR_PROBABILITY_PCT != 0 && f->seqNum == 2 && !g_errorAlreadyInjected)
-  {
-    int byteIdx = 0;
-    int bitIdx = 3;
+    if (g_errorAlreadyInjected)
+        return;
+
+    if (f->seqNum != g_errorFrameSeq)
+        return;
+
+    // Choisir un octet aléatoire
+    uint8_t byteIdx = esp_random() % f->payloadLen;
+
+    // Choisir un bit aléatoire
+    uint8_t bitIdx = esp_random() % 8;
+
     f->payload[byteIdx] ^= (1 << bitIdx);
+
     g_errorAlreadyInjected = true;
+
     logAppend(g_txLogBuf, &g_txLogLen,
-              "[TX] *** ERREUR INJECTEE *** bit %d de l'octet %d du paquet seq=%d\n",
-              bitIdx, byteIdx, f->seqNum);
-  }
+              "[TX] *** ERREUR INJECTÉE *** trame=%d octet=%d bit=%d\n",
+              f->seqNum,
+              byteIdx,
+              bitIdx);
 }
 
 // ============================================================================
@@ -463,6 +473,16 @@ void sendAcquisitionMessage()
 
   logAppend(g_txLogBuf, &g_txLogLen, "[TX] J'envoie %d paquets de donnees\n", totalPackets);
   g_errorAlreadyInjected = false;
+
+  // Choisit une des trames de données (1 à totalPackets)
+  if (ENABLE_ERROR_INJECTION)
+      g_errorFrameSeq = (esp_random() % totalPackets) + 1;
+  else
+      g_errorFrameSeq = 0;
+
+  logAppend(g_txLogBuf, &g_txLogLen,
+            "[TX] Injection d'erreur prévue sur la trame %d\n",
+            g_errorFrameSeq);
   g_remoteNackReceived = false; // reset: ignorer tout residu d'une session precedente
   g_localGapDetected = false;
 
