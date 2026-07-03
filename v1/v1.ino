@@ -475,14 +475,17 @@ void sendAcquisitionMessage()
   g_errorAlreadyInjected = false;
 
   // Choisit une des trames de données (1 à totalPackets)
-  if (ENABLE_ERROR_INJECTION)
-      g_errorFrameSeq = (esp_random() % totalPackets) + 1;
-  else
-      g_errorFrameSeq = 0;
+  if (ENABLE_ERROR_INJECTION) {
+    g_errorFrameSeq = (esp_random() % totalPackets) + 1;
+    logAppend(g_txLogBuf, &g_txLogLen,
+      "[TX] Injection d'erreur prévue sur la trame %d\n",
+      g_errorFrameSeq);
+  }
+  else {
+    g_errorFrameSeq = 0;
+  }
 
-  logAppend(g_txLogBuf, &g_txLogLen,
-            "[TX] Injection d'erreur prévue sur la trame %d\n",
-            g_errorFrameSeq);
+  
   g_remoteNackReceived = false; // reset: ignorer tout residu d'une session precedente
   g_localGapDetected = false;
 
