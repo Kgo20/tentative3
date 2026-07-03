@@ -466,34 +466,34 @@ int loadDonneesIntoPackets(uint8_t packets[][MAX_PAYLOAD], uint8_t *packetLens, 
 }
 
 bool g_errorAlreadyInjected = false; // n'injecter qu'une seule fois par session (pas a chaque retransmission)
-uint8_t g_errorFrameSeq = 0;   // numéro de trame (1..5) qui sera corrompue
+uint8_t g_errorFrameSeq = 0;         // numéro de trame (1..5) qui sera corrompue
 
 void maybeInjectBitError(Frame *f)
 {
-    if (!f || f->payloadLen == 0)
-        return;
+  if (!f || f->payloadLen == 0)
+    return;
 
-    if (g_errorAlreadyInjected)
-        return;
+  if (g_errorAlreadyInjected)
+    return;
 
-    if (f->seqNum != g_errorFrameSeq)
-        return;
+  if (f->seqNum != g_errorFrameSeq)
+    return;
 
-    // Choisir un octet aléatoire
-    uint8_t byteIdx = esp_random() % f->payloadLen;
+  // Choisir un octet aléatoire
+  uint8_t byteIdx = esp_random() % f->payloadLen;
 
-    // Choisir un bit aléatoire
-    uint8_t bitIdx = esp_random() % 8;
+  // Choisir un bit aléatoire
+  uint8_t bitIdx = esp_random() % 8;
 
-    f->payload[byteIdx] ^= (1 << bitIdx);
+  f->payload[byteIdx] ^= (1 << bitIdx);
 
-    g_errorAlreadyInjected = true;
+  g_errorAlreadyInjected = true;
 
-    logAppend(g_txLogBuf, &g_txLogLen,
-              "[TX] *** ERREUR INJECTÉE *** trame=%d octet=%d bit=%d\n",
-              f->seqNum,
-              byteIdx,
-              bitIdx);
+  logAppend(g_txLogBuf, &g_txLogLen,
+            "[TX] *** ERREUR INJECTÉE *** trame=%d octet=%d bit=%d\n",
+            f->seqNum,
+            byteIdx,
+            bitIdx);
 }
 
 // ============================================================================
@@ -513,17 +513,18 @@ void sendAcquisitionMessage()
   g_errorAlreadyInjected = false;
 
   // Choisit une des trames de données (1 à totalPackets)
-  if (ENABLE_ERROR_INJECTION) {
+  if (ENABLE_ERROR_INJECTION)
+  {
     g_errorFrameSeq = (esp_random() % totalPackets) + 1;
     logAppend(g_txLogBuf, &g_txLogLen,
-      "[TX] Injection d'erreur prévue sur la trame %d\n",
-      g_errorFrameSeq);
+              "[TX] Injection d'erreur prévue sur la trame %d\n",
+              g_errorFrameSeq);
   }
-  else {
+  else
+  {
     g_errorFrameSeq = 0;
   }
 
-  
   g_remoteNackReceived = false; // reset: ignorer tout residu d'une session precedente
   g_localGapDetected = false;
 
@@ -531,8 +532,16 @@ void sendAcquisitionMessage()
   buildFrame(&fBegin, FRAME_TYPE_DEBUT, 0, totalPackets, 0, 0);
   sendFrame(&fBegin);
 
+  // Boucle d'envoi continue. Une fois tous les paquets envoyes (i==totalPackets),
+  // on ne sort pas immediatement: la derniere trame peut encore etre en train de
+  // generer un NACK cote recepteur (aller-retour du fil pas instantane), donc on
+  // laisse une courte fenetre de grace sans activite avant de clore la session,
+  // sinon FIN partirait pendant qu'un NACK est encore en vol.
   int i = 0;
-  while (i < totalPackets)
+  uint32_t lastActivityTime = millis();
+  const uint32_t gracePeriodMs = 200;
+
+  while (i < totalPackets || (millis() - lastActivityTime) < gracePeriodMs)
   {
     if (g_remoteNackReceived)
     {
@@ -541,7 +550,13 @@ void sendAcquisitionMessage()
       logAppend(g_txLogBuf, &g_txLogLen,
                 "[TX] NACK recu -> retransmission a partir de la trame %d\n", target);
       i = target - 1;
+      lastActivityTime = millis();
       continue;
+    }
+
+    if (i >= totalPackets)
+    {
+      continue; // en attente de la fenetre de grace, plus de paquet a envoyer
     }
 
     Frame fData;
@@ -549,6 +564,7 @@ void sendAcquisitionMessage()
     logAppend(g_txLogBuf, &g_txLogLen, "[TX] Envoi trame %d: %s\n", i + 1, acquireDonnees(i));
     maybeInjectBitError(&fData);
     sendFrame(&fData);
+    lastActivityTime = millis();
 
     if (g_localGapDetected)
     {
@@ -559,6 +575,7 @@ void sendAcquisitionMessage()
       sendFrame(&fNack);
       logAppend(g_txLogBuf, &g_txLogLen,
                 "[TX] Erreur detectee sur la reception locale -> envoi d'un NACK pour la trame %d\n", target);
+      lastActivityTime = millis();
     }
 
     i++;
