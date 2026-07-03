@@ -11,7 +11,7 @@
 
 #define TX_PIN 4
 #define RX_PIN 5
-#define BIT_PERIOD_US 1000 // 1 bit = 1ms
+#define BIT_PERIOD_US 1000 // duree totale d'un bit Manchester (2 demi-periodes de 250us)
 
 #define PREAMBLE_BYTE 0x55 // 01010101 -- synchronisation
 #define START_BYTE 0x7E    // 01111110 -- délimiteur début
@@ -89,29 +89,39 @@ void logFlush(char *buf, size_t *len)
 }
 
 // ============================================================================
-// ENCODAGE NRZ BAS NIVEAU
+// ENCODAGE MANCHESTER BAS NIVEAU
 // ============================================================================
-// Convention NRZ simple : 0 = LOW (maintenu 1ms), 1 = HIGH (maintenu 1ms)
+// Convention (G.E. Thomas / IEEE 802.3): bit 1 = HIGH puis LOW (transition
+// descendante au centre du bit), bit 0 = LOW puis HIGH (transition montante
+// au centre du bit). BIT_PERIOD_US est la duree totale d'UN bit, soit deux
+// demi-periodes de BIT_PERIOD_US/2 chacune.
 
 // Horloge TX absolue: chaque sendByte() repart d'un temps de reference figé
 // une seule fois par trame (voir sendFrame), pour que digitalWrite()/l'overhead
-// de boucle ne s'accumule pas bit apres bit sur les trames longues (payload
-// jusqu'a 80 octets = ~700 bits). Un delai relatif (delayMicroseconds apres
-// digitalWrite) derive de quelques us par bit, ce qui suffit a desynchroniser
-// le recepteur (horloge absolue, lui aussi figee une seule fois) sur une
-// trame de plusieurs centaines de bits.
+// de boucle ne s'accumule pas demi-bit apres demi-bit sur les trames longues
+// (payload jusqu'a 80 octets = ~700 bits = ~1400 demi-bits). Un delai relatif
+// derive de quelques us par demi-bit, ce qui suffit a desynchroniser le
+// recepteur (horloge absolue, lui aussi figee une seule fois) sur une trame
+// de plusieurs centaines de bits.
 uint32_t g_txClockStart = 0;
-int g_txBitIndex = 0;
+int g_txHalfBitIndex = 0;
+
+void sendHalfBit(bool levelHigh)
+{
+  digitalWrite(TX_PIN, levelHigh ? HIGH : LOW);
+  uint32_t targetTime = g_txClockStart + ((g_txHalfBitIndex + 1) * (uint32_t)(BIT_PERIOD_US / 2));
+  while (micros() < targetTime)
+  {
+    // Spin jusqu'a la fin exacte du demi-bit (horloge absolue, pas de derive cumulee)
+  }
+  g_txHalfBitIndex++;
+}
 
 void sendBit(bool bitValue)
 {
-  digitalWrite(TX_PIN, bitValue ? HIGH : LOW);
-  uint32_t targetTime = g_txClockStart + ((g_txBitIndex + 1) * (uint32_t)BIT_PERIOD_US);
-  while (micros() < targetTime)
-  {
-    // Spin jusqu'a la fin exacte du bit (horloge absolue, pas de derive cumulee)
-  }
-  g_txBitIndex++;
+  // bit 1: HIGH -> LOW : bit 0: LOW -> HIGH
+  sendHalfBit(bitValue ? HIGH : LOW);
+  sendHalfBit(bitValue ? LOW : HIGH);
 }
 
 void sendByte(uint8_t b)
@@ -122,34 +132,49 @@ void sendByte(uint8_t b)
   }
 }
 
-// Variable globale pour synchroniser l'horloge d'échantillonnage des bits
+// Variable globale pour synchroniser l'horloge d'échantillonnage (index de bit entier;
+// receiveBitWithGlobalClock derive en interne les deux demi-periodes correspondantes)
 uint32_t g_rxClockStart = 0;
 int g_rxBitIndex = 0;
 
-// Lit un bit en utilisant l'horloge globale d'échantillonnage
+// Lit un bit Manchester en echantillonnant les deux demi-periodes: le niveau
+// du premier demi-bit donne directement la valeur (HIGH=1, LOW=0), le second
+// demi-bit est lu seulement pour verifier la transition attendue (integrite).
 bool receiveBitWithGlobalClock(uint32_t bitPeriodUs, int bitIndex, bool *outBit)
 {
   if (!outBit)
     return false;
 
-  // Calculer le moment d'échantillonnage pour ce bit (au centre du bit)
-  uint32_t sampleTime = g_rxClockStart + (bitIndex * bitPeriodUs) + (bitPeriodUs / 2);
-  uint32_t timeoutTime = g_rxClockStart + ((bitIndex + 1) * bitPeriodUs);
+  uint32_t halfPeriodUs = bitPeriodUs / 2;
+  int firstHalfIndex = bitIndex * 2;
 
-  // Attendre le moment d'échantillonnage
-  while (micros() < sampleTime)
+  uint32_t sampleTime1 = g_rxClockStart + (firstHalfIndex * halfPeriodUs) + (halfPeriodUs / 2);
+  uint32_t sampleTime2 = g_rxClockStart + ((firstHalfIndex + 1) * halfPeriodUs) + (halfPeriodUs / 2);
+  uint32_t timeoutTime = g_rxClockStart + ((firstHalfIndex + 2) * halfPeriodUs);
+
+  while (micros() < sampleTime1)
   {
-    // Spin jusqu'au moment d'échantillonner
+    // Spin jusqu'au centre du premier demi-bit
   }
+  bool firstHalf = digitalRead(RX_PIN) == HIGH;
 
-  *outBit = digitalRead(RX_PIN) == HIGH;
+  while (micros() < sampleTime2)
+  {
+    // Spin jusqu'au centre du second demi-bit
+  }
+  bool secondHalf = digitalRead(RX_PIN) == HIGH;
 
-  // Attendre la fin du bit
   while (micros() < timeoutTime)
   {
-    // Attendre le prochain bit
+    // Attendre la fin exacte du bit
   }
 
+  if (firstHalf == secondHalf)
+  {
+    return false; // pas de transition au centre: viole le codage Manchester
+  }
+
+  *outBit = firstHalf; // HIGH->LOW = 1, LOW->HIGH = 0
   return true;
 }
 
@@ -174,29 +199,36 @@ bool receiveByte(uint8_t *outByte, uint32_t bitPeriodUs)
 }
 
 // ============================================================================
-// CALIBRATION DU PRÉAMBULE
+// CALIBRATION DU PRÉAMBULE (Manchester)
 // ============================================================================
-// Le préambule 0x55 (01010101) alterne à chaque bit en NRZ => transition tous
-// les ~1ms. Ligne idle = LOW. 0x55 commence par un bit 0 (LOW), donc il n'y a
-// PAS de front au tout début du préambule : le premier front utile est la
-// transition LOW->HIGH entre le bit0 (0) et le bit1 (1). On s'accroche à CE
-// front précis, on calcule le centre du bit1 à partir de là, puis on relit
-// les 8 bits pour valider que c'est bien 0x55. Si la validation échoue (glitch,
-// front capté au milieu d'un préambule déjà en cours, bruit), on réessaie
-// entièrement au lieu d'abandonner.
+// Le préambule 0x55 (01010101) produit en Manchester une transition a chaque
+// demi-periode, sauf a une frontiere sur deux entre bits (plateau de 2 demi-
+// periodes au meme niveau) -- il y a donc plusieurs phases possibles pour le
+// premier front capte (il peut tomber sur n'importe quelle frontiere de
+// demi-bit du preambule, pas seulement la toute premiere). On s'accroche a un
+// front, on suppose une phase (le front = fin du demi-bit courant), puis on
+// relit les 8 bits pour valider 0x55. Si l'hypothese est fausse, le busy-wait
+// de la relecture a deja consomme le temps reel correspondant: on ne peut pas
+// revenir en arriere, donc on rearme simplement sur le prochain front reel
+// (qui, statistiquement, finit par tomber sur la bonne phase en quelques
+// tentatives grace au bruit/gigue naturel de detection).
 bool detectAndCalibrateOnPreamble(uint32_t bitPeriodUs)
 {
-  const int maxAttempts = 20;
+  const int maxAttempts = 60;
+  uint32_t halfPeriodUs = bitPeriodUs / 2;
+
   for (int attempt = 0; attempt < maxAttempts; attempt++)
   {
-    // Étape A: s'assurer que la ligne est idle (LOW) avant d'armer la détection,
-    // pour éviter de s'accrocher à un front au milieu d'une trame déjà en cours.
+    // La ligne de repos est toujours LOW (sendFrame la force explicitement a
+    // LOW apres chaque trame). On s'assure d'abord d'etre sur ce niveau avant
+    // d'armer, pour ne pas s'accrocher a un front au milieu d'une trame deja
+    // en cours.
     while (digitalRead(RX_PIN) == HIGH)
     {
-      esp_rom_delay_us(50);
+      esp_rom_delay_us(5);
     }
 
-    // Étape B: attendre le front montant LOW->HIGH (transition bit0->bit1 du 0x55)
+    // Attendre le front montant LOW->HIGH.
     uint32_t armStart = micros();
     while (digitalRead(RX_PIN) == LOW)
     {
@@ -204,43 +236,43 @@ bool detectAndCalibrateOnPreamble(uint32_t bitPeriodUs)
       {
         break; // rien reçu depuis 2s: on relance une nouvelle tentative propre
       }
-      esp_rom_delay_us(50);
+      esp_rom_delay_us(5);
     }
     if (digitalRead(RX_PIN) == LOW)
     {
-      continue; // timeout d'armement, on recommence l'étape A/B
+      continue; // timeout d'armement, on recommence
     }
 
     uint32_t frontTime = micros();
-    uint32_t bit1Center = frontTime + (bitPeriodUs / 2);
 
-    // On relit les bits 1 à 7 (le bit0 est implicite = 0) pour valider le motif.
-    uint8_t preambleByte = 0;
-    uint32_t sampleTime = bit1Center;
+    // La ligne est idle LOW avant la trame. Le bit0 du preambule 0x55 vaut 0
+    // (LOW->HIGH), donc sa transition tombe exactement au CENTRE du bit0 (pas
+    // a son debut) -- ce centre vient de passer, on ne peut plus l'echantillonner
+    // retroactivement. On se positionne donc sur le bit1 (valeur 1, HIGH->LOW):
+    // son premier demi-bit (HIGH) commence exactement a frontTime.
+    g_rxClockStart = frontTime - halfPeriodUs; // debut theorique du bit0 (le front est a son centre)
+    g_rxBitIndex = 1;                          // on commence la lecture au bit1
 
-    for (int i = 1; i < 8; i++)
+    uint8_t preambleByte = 0; // bit0 du preambule 0x55 est toujours 0 (implicite: front LOW->HIGH capte)
+    bool valid = true;
+    for (int i = 0; i < 7; i++)
     {
-      while (micros() < sampleTime)
+      bool bit;
+      if (!receiveBitWithGlobalClock(bitPeriodUs, g_rxBitIndex, &bit))
       {
-        // Spin (précision microseconde requise pour l'échantillonnage)
+        valid = false;
+        break;
       }
-      bool bit = (digitalRead(RX_PIN) == HIGH);
       preambleByte = (preambleByte << 1) | (bit ? 1 : 0);
-      sampleTime += bitPeriodUs;
+      g_rxBitIndex++;
     }
 
-    if (preambleByte != PREAMBLE_BYTE)
+    if (valid && preambleByte == PREAMBLE_BYTE)
     {
-      continue;
+      // g_rxClockStart/g_rxBitIndex sont corrects: le prochain bit a lire
+      // est le bit8 (START_BYTE bit0).
+      return true;
     }
-
-    // Initialiser l'horloge globale. Le bit8 (START_BYTE bit0) est le prochain
-    // bit après le bit7 du préambule. sampleTime pointe déjà au centre du bit8.
-    // g_rxClockStart doit satisfaire: sampleTime(bitIndex) = g_rxClockStart + bitIndex*bitPeriodUs + bitPeriodUs/2
-    g_rxClockStart = sampleTime - (8 * bitPeriodUs) - (bitPeriodUs / 2);
-    g_rxBitIndex = 8; // Prochain bit à lire = bit 8 (START_BYTE)
-
-    return true;
   }
 
   return false;
@@ -281,7 +313,7 @@ void sendFrame(const Frame *f)
     return;
 
   g_txClockStart = micros();
-  g_txBitIndex = 0;
+  g_txHalfBitIndex = 0;
 
   sendByte(PREAMBLE_BYTE);
   sendByte(START_BYTE);
@@ -300,6 +332,12 @@ void sendFrame(const Frame *f)
   sendByte((f->crc >> 8) & 0xFF);
 
   sendByte(END_BYTE);
+
+  // Remet la ligne a un niveau de repos connu (LOW) apres chaque trame: le
+  // dernier demi-bit de END_BYTE (0x7E finit par un bit 0 = LOW->HIGH) laisse
+  // sinon la ligne a HIGH entre deux trames, ce qui ambiguise la detection de
+  // "front" au prochain armement de detectAndCalibrateOnPreamble.
+  digitalWrite(TX_PIN, LOW);
 }
 
 bool receiveFrame(Frame *f)
